@@ -1,0 +1,158 @@
+import bpy
+import bmesh
+import math
+import wave
+import struct
+import os
+
+# ================= CONFIGURATION =================
+FILE_PATH = "/Users/YourName/Desktop/song.wav"  # <-- UPDATE THIS 
+HOLE_RADIUS = 3.65      
+THICKNESS = 2.0 
+        
+#Project Name: [3d printed LP record]
+#Author: [JohnJohn Nevado/JohnJohn-N]
+#Date: January 2026
+#LICENSE: This code is licensed under Creative Commons Attribution-NonCommercial 4.0.
+#You are free to share and adapt this code for personal use.
+#Commercial use, selling, or redistribution for profit is STRICTLY PROHIBITED 
+#without express written permission from the author.
+
+# GROOVE SETTINGS (High Fidelity Lateral)
+GROOVE_DEPTH = 0.4      
+GROOVE_WIDTH = 0.6      
+PITCH = 1.2             
+AMPLITUDE_SCALE = 0.15  
+
+RPM = 33.33
+AUDIO_DURATION = 30.0   
+
+# RESOLUTION 
+RADIAL_RES = 0.15       
+ANGULAR_RES = 4500      
+# =================================================
+
+def create_solid_lateral_record():
+    # 1. LOAD AUDIO
+    if not os.path.exists(FILE_PATH):
+        print(f"ERROR: File not found at {FILE_PATH}")
+        return
+
+    try:
+        with wave.open(FILE_PATH, 'rb') as w:
+            frames = w.readframes(int(w.getframerate() * AUDIO_DURATION))
+            samples = struct.unpack(f"<{len(frames)//2}h", frames)
+            audio_raw = [s / 32768.0 for s in samples[::2]]
+    except Exception as e:
+        print(f"Audio Error: {e}")
+        return
+
+    # 2. SETUP MESH
+    mesh = bpy.data.meshes.new("Lateral_Record_Solid")
+    obj = bpy.data.objects.new("Lateral_Record_Solid", mesh)
+    bpy.context.collection.objects.link(obj)
+    bm = bmesh.new()
+
+    # 3. CALCULATE GEOMETRY LIMITS
+    turns = (AUDIO_DURATION / 60) * RPM
+    outer_r = (DIAMETER / 2) - 2.0
+    band_width = turns * PITCH
+    
+    # 4. GENERATE TOP SURFACE (The Grooves)
+    total_rings = int(band_width / RADIAL_RES)
+    grid_verts = []
+
+    print("Generating Solid Geometry... Please Wait.")
+
+    for r_idx in range(total_rings + 1):
+        base_r_spiral_start = outer_r - (r_idx * RADIAL_RES)
+        ring_verts = []
+        
+        for a_idx in range(ANGULAR_RES):
+            angle_ratio = a_idx / ANGULAR_RES
+            angle_rad = angle_ratio * 2 * math.pi
+            
+            # Spiral Math
+            dist_from_outer = (r_idx * RADIAL_RES)
+            spiral_offset = (angle_ratio * PITCH)
+            center_r = outer_r - dist_from_outer - spiral_offset
+            
+            # Audio Mapping
+            total_turn_pct = (outer_r - center_r) / band_width
+            sample_idx = int(total_turn_pct * len(audio_raw))
+            
+            audio_displacement = 0
+            if 0 <= sample_idx < len(audio_raw):
+                audio_displacement = audio_raw[sample_idx] * AMPLITUDE_SCALE
+            
+            # Groove Profile
+            current_grid_r = base_r_spiral_start - spiral_offset
+            pos_in_groove = (outer_r - current_grid_r) % PITCH
+            if pos_in_groove > PITCH / 2: pos_in_groove -= PITCH
+            dist_from_groove_center = pos_in_groove 
+            
+            z = 0
+            if abs(dist_from_groove_center) < (GROOVE_WIDTH / 2):
+                profile = math.cos((dist_from_groove_center / (GROOVE_WIDTH/2)) * (math.pi/2))
+                z -= (profile * GROOVE_DEPTH)
+            
+            # Create Vertex
+            final_r = current_grid_r + audio_displacement
+            v = bm.verts.new((final_r * math.cos(angle_rad), final_r * math.sin(angle_rad), z))
+            ring_verts.append(v)
+            
+        grid_verts.append(ring_verts)
+
+    # Stitch Top Faces
+    for r in range(len(grid_verts) - 1):
+        for a in range(ANGULAR_RES):
+            v1 = grid_verts[r][a]
+            v2 = grid_verts[r][(a+1) % ANGULAR_RES] 
+            v3 = grid_verts[r+1][(a+1) % ANGULAR_RES]
+            v4 = grid_verts[r+1][a]
+            bm.faces.new((v1, v2, v3, v4))
+
+    # Fill Center (Top)
+    inner_edge_verts = grid_verts[-1]
+    center_vert = bm.verts.new((0, 0, 0))
+    for i in range(len(inner_edge_verts)):
+        v1 = inner_edge_verts[i]
+        v2 = inner_edge_verts[(i+1) % len(inner_edge_verts)]
+        bm.faces.new((v1, v2, center_vert))
+
+    # 5. SOLIDIFY (Extrude Down & Flatten)
+    # Ensure normals are consistent before extruding
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    
+    # Extrude everything down
+    res = bmesh.ops.extrude_face_region(bm, geom=bm.faces)
+    extruded_verts = [v for v in res['geom'] if isinstance(v, bmesh.types.BMVert)]
+    
+    # Force Flat Bottom
+    for v in extruded_verts:
+        v.co.z = -THICKNESS
+    
+    # 6. CRITICAL FIX: RECALCULATE NORMALS (Fixes "Invisible Bottom")
+    # This forces Blender to check "which way is out" for the whole block
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+    # 7. WELD SEAM
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)
+
+    bm.to_mesh(mesh)
+    bm.free()
+    
+    # 8. CUT PINHOLE (Boolean)
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.mesh.primitive_cylinder_add(radius=HOLE_RADIUS, depth=THICKNESS*5, location=(0,0,-THICKNESS))
+    cutter = bpy.context.object
+    bool_mod = obj.modifiers.new(name="Hole", type='BOOLEAN')
+    bool_mod.object = cutter
+    bool_mod.operation = 'DIFFERENCE'
+    bool_mod.solver = 'EXACT'
+    bpy.ops.object.modifier_apply(modifier="Hole")
+    bpy.data.objects.remove(cutter)
+    
+    print("SUCCESS: Solid Record Created. Ready to Export.")
+
+create_solid_lateral_record()
